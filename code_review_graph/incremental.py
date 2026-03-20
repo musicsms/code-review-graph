@@ -9,6 +9,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -18,6 +19,40 @@ from .graph import GraphStore
 from .parser import CodeParser
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+_SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_./:~^@{}\-]+$")
+_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB – skip files larger than this
+
+
+def _validate_git_ref(ref: str) -> str:
+    """Validate a git ref to prevent command injection.
+
+    Only allows alphanumeric characters and common git ref symbols.
+    Rejects refs starting with ``-`` to prevent option injection.
+    """
+    if not ref or len(ref) > 256:
+        raise ValueError(f"Invalid git ref: empty or too long (max 256 chars)")
+    if ref.startswith("-"):
+        raise ValueError(f"Git ref must not start with a dash: {ref!r}")
+    if not _SAFE_GIT_REF.match(ref):
+        raise ValueError(
+            f"Git ref contains unsafe characters: {ref!r}. "
+            f"Allowed: A-Z a-z 0-9 _ . / : ~ ^ @ {{ }} -"
+        )
+    return ref
+
+
+def _is_safe_path(path: Path, repo_root: Path) -> bool:
+    """Reject symlinks that resolve outside the repository root."""
+    try:
+        resolved = path.resolve()
+        return resolved.is_relative_to(repo_root.resolve())
+    except (OSError, ValueError):
+        return False
 
 # Default ignore patterns (in addition to .gitignore)
 DEFAULT_IGNORE_PATTERNS = [
@@ -132,6 +167,7 @@ _GIT_TIMEOUT = 30  # seconds
 
 def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     """Get list of changed files via git diff."""
+    base = _validate_git_ref(base)
     try:
         result = subprocess.run(
             ["git", "diff", "--name-only", base],
@@ -217,11 +253,18 @@ def collect_all_files(repo_root: Path) -> list[str]:
         full_path = repo_root / rel_path
         if not full_path.is_file():
             continue
-        if full_path.is_symlink():
+        if full_path.is_symlink() or not _is_safe_path(full_path, repo_root):
             continue
         if parser.detect_language(full_path) is None:
             continue
         if _is_binary(full_path):
+            continue
+        # Skip files exceeding size limit to prevent resource exhaustion
+        try:
+            if full_path.stat().st_size > _MAX_FILE_SIZE:
+                logger.debug("Skipping large file: %s", rel_path)
+                continue
+        except OSError:
             continue
         files.append(rel_path)
 

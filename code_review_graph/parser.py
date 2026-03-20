@@ -18,6 +18,111 @@ import tree_sitter_language_pack as tslp
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Security classification patterns
+# ---------------------------------------------------------------------------
+
+# Maps security tag -> set of function/method name patterns (lowercase)
+_SECURITY_TAGS: dict[str, set[str]] = {
+    "auth": {
+        "login", "logout", "authenticate", "authorize", "check_permission",
+        "check_permissions", "has_permission", "has_perm", "is_authenticated",
+        "require_auth", "verify_token", "validate_token", "check_access",
+        "require_login", "login_required", "permission_required",
+        "check_role", "verify_password", "hash_password", "sign_in",
+        "sign_out", "register", "signup", "create_user",
+    },
+    "crypto": {
+        "encrypt", "decrypt", "sign", "verify", "hash", "digest",
+        "sha256", "sha512", "sha1", "md5", "hmac", "pbkdf2",
+        "bcrypt", "scrypt", "argon2", "generate_key", "derive_key",
+        "aes_encrypt", "rsa_encrypt", "jwt_sign", "jwt_verify",
+        "encode", "decode",  # JWT-related
+    },
+    "input_handler": {
+        "get", "post", "put", "delete", "patch",  # HTTP handlers
+        "handle", "handle_request", "process_request",
+        "parse_input", "parse_body", "parse_form",
+        "read_input", "get_input", "sanitize", "validate_input",
+        "clean", "escape",
+    },
+    "data_access": {
+        "execute", "query", "find", "find_one", "find_all",
+        "select", "insert", "update", "delete",  # SQL/ORM
+        "save", "create", "destroy", "get_or_create",
+        "filter", "aggregate", "raw", "execute_sql",
+        "cursor", "fetchone", "fetchall", "fetchmany",
+        "commit", "rollback",
+    },
+    "dangerous_sink": {
+        "eval", "exec", "compile", "execfile",
+        "system", "popen", "call", "check_output", "check_call",
+        "run",  # subprocess.run
+        "getattr", "setattr", "__import__",
+        "globals", "locals",
+        "send_redirect", "redirect",  # open redirects
+        "inner_html", "innerhtml", "document_write",
+    },
+    "serialization": {
+        "loads", "load", "dumps", "dump",  # pickle/json/yaml
+        "deserialize", "serialize", "unmarshal", "marshal",
+        "from_json", "to_json", "from_yaml", "to_yaml",
+        "from_xml", "parse_xml",
+        "pickle_loads", "pickle_load",
+    },
+    "file_io": {
+        "open", "read", "write", "read_text", "write_text",
+        "read_bytes", "write_bytes", "readlines", "writelines",
+        "copy", "move", "rename", "unlink", "remove", "rmdir",
+        "makedirs", "mkdir", "chmod", "chown",
+        "glob", "walk", "listdir", "scandir",
+        "upload", "download", "save_file",
+    },
+    "network": {
+        "request", "urlopen", "urlretrieve",
+        "get", "post", "put", "delete",  # requests library
+        "fetch", "connect", "send", "recv",
+        "socket", "bind", "listen", "accept",
+        "http_request", "api_call", "webhook",
+    },
+}
+
+# Function name patterns that indicate a function IS a security-sensitive
+# definition (not a call to one). These tag the function node itself.
+_SECURITY_FUNC_PATTERNS: dict[str, list[str]] = {
+    "auth": [
+        "login", "logout", "auth", "permission", "access", "role",
+        "token", "session", "credential", "password", "signup",
+        "register", "verify", "sign_in", "sign_out",
+    ],
+    "crypto": [
+        "encrypt", "decrypt", "hash", "sign", "verify", "hmac",
+        "key", "cipher", "digest", "jwt", "token",
+    ],
+    "input_handler": [
+        "handle", "handler", "endpoint", "route", "view",
+        "controller", "api_", "process_request", "dispatch",
+        "parse_", "validate_", "sanitize",
+    ],
+    "data_access": [
+        "query", "repository", "dao", "store", "fetch",
+        "get_", "list_", "create_", "update_", "delete_",
+        "find_", "save_", "load_",
+    ],
+}
+
+# Decorator names that indicate security-relevant functions
+_SECURITY_DECORATORS: dict[str, set[str]] = {
+    "auth": {
+        "login_required", "permission_required", "requires_auth",
+        "authenticated", "authorize", "require_role",
+    },
+    "input_handler": {
+        "route", "app.route", "api_view", "get", "post", "put", "delete",
+        "endpoint", "action", "RequestMapping", "GetMapping", "PostMapping",
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Data models for extracted entities
 # ---------------------------------------------------------------------------
 
@@ -321,6 +426,14 @@ class CodeParser:
                     params = self._get_params(child, language, source)
                     ret_type = self._get_return_type(child, language, source)
 
+                    # Classify security tags for this function
+                    func_sec_tags = _classify_func_security(
+                        name, child, language, source
+                    )
+                    func_extra: dict = {}
+                    if func_sec_tags:
+                        func_extra["security_tags"] = sorted(func_sec_tags)
+
                     node = NodeInfo(
                         kind=kind,
                         name=name,
@@ -332,6 +445,7 @@ class CodeParser:
                         params=params,
                         return_type=ret_type,
                         is_test=is_test,
+                        extra=func_extra,
                     )
                     nodes.append(node)
 
@@ -374,12 +488,21 @@ class CodeParser:
                 call_name = self._get_call_name(child, language, source)
                 if call_name and enclosing_func:
                     caller = self._qualify(enclosing_func, file_path, enclosing_class)
+                    # Classify security tags for this call
+                    call_sec_tags = _classify_call_security(call_name)
+                    edge_extra: dict = {}
+                    if call_sec_tags:
+                        edge_extra["security_tags"] = sorted(call_sec_tags)
+                        # Mark taint-relevant flows
+                        if "dangerous_sink" in call_sec_tags:
+                            edge_extra["taint_relevant"] = True
                     edges.append(EdgeInfo(
                         kind="CALLS",
                         source=caller,
                         target=call_name,
                         file_path=file_path,
                         line=child.start_point[0] + 1,
+                        extra=edge_extra,
                     ))
 
             # Recurse for other node types
@@ -576,3 +699,64 @@ class CodeParser:
             return first.text.decode("utf-8", errors="replace")
 
         return None
+
+
+# ---------------------------------------------------------------------------
+# Security classification helpers (module-level, used by _extract_from_tree)
+# ---------------------------------------------------------------------------
+
+
+def _classify_call_security(call_name: str) -> set[str]:
+    """Classify a function/method call by security relevance.
+
+    Returns the set of security tags that apply to this call target.
+    """
+    tags: set[str] = set()
+    name_lower = call_name.lower()
+    # Strip dotted prefix (e.g. "os.system" → check "system")
+    simple_name = name_lower.rsplit(".", 1)[-1] if "." in name_lower else name_lower
+
+    for tag, patterns in _SECURITY_TAGS.items():
+        if simple_name in patterns:
+            tags.add(tag)
+        # Also check full dotted name for specificity
+        elif name_lower in patterns:
+            tags.add(tag)
+
+    return tags
+
+
+def _classify_func_security(
+    name: str,
+    ast_node,
+    language: str,
+    source: bytes,
+) -> set[str]:
+    """Classify a function/method definition by security relevance.
+
+    Checks the function name and its decorators against known security patterns.
+    Returns the set of security tags that apply to this function.
+    """
+    tags: set[str] = set()
+    name_lower = name.lower()
+
+    # Check function name against security patterns
+    for tag, patterns in _SECURITY_FUNC_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in name_lower:
+                tags.add(tag)
+                break
+
+    # Check decorators (Python, TypeScript, Java annotations, etc.)
+    for child in ast_node.children:
+        if child.type in ("decorator", "annotation", "decorator_list"):
+            dec_text = child.text.decode("utf-8", errors="replace").lower()
+            # Strip @ prefix
+            dec_text = dec_text.lstrip("@").strip()
+            for tag, dec_names in _SECURITY_DECORATORS.items():
+                for dec_name in dec_names:
+                    if dec_name.lower() in dec_text:
+                        tags.add(tag)
+                        break
+
+    return tags

@@ -433,6 +433,8 @@ class GraphStore:
         batch_size = 450  # Stay well under SQLite's default 999 limit
         for i in range(0, len(qns), batch_size):
             batch = qns[i:i + batch_size]
+            # The f-string only constructs "?" placeholder symbols.
+            # Actual values are passed via parameterized `batch` list — safe.
             placeholders = ",".join("?" for _ in batch)
             rows = self._conn.execute(  # nosec B608
                 f"SELECT * FROM edges WHERE source_qualified IN ({placeholders})",
@@ -443,6 +445,90 @@ class GraphStore:
                 if edge.target_qualified in qualified_names:
                     results.append(edge)
         return results
+
+    # --- Security-focused queries ---
+
+    def get_nodes_by_security_tag(self, tag: str) -> list[GraphNode]:
+        """Return all nodes that have the given security tag in their extra field."""
+        # Use SQLite JSON functions to query inside the extra JSON field
+        pattern = f'%"{tag}"%'
+        rows = self._conn.execute(
+            """SELECT * FROM nodes
+               WHERE json_extract(extra, '$.security_tags') LIKE ?""",
+            (pattern,),
+        ).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
+    def find_paths_to_sinks(
+        self,
+        source_qn: str,
+        sink_tags: list[str] | None = None,
+        max_depth: int = 5,
+    ) -> list[list[str]]:
+        """BFS from a source node to find call paths reaching security-sensitive sinks.
+
+        Args:
+            source_qn: Qualified name of the source node.
+            sink_tags: Security tags to treat as sinks (default: ["dangerous_sink"]).
+            max_depth: Maximum path length to search.
+
+        Returns:
+            List of paths, where each path is a list of qualified names.
+        """
+        if sink_tags is None:
+            sink_tags = ["dangerous_sink"]
+        sink_tag_set = set(sink_tags)
+
+        # Build sink set: all nodes with any of the sink tags
+        sink_nodes: set[str] = set()
+        for tag in sink_tag_set:
+            for n in self.get_nodes_by_security_tag(tag):
+                sink_nodes.add(n.qualified_name)
+
+        # Also check edges: CALLS edges whose extra has those tags
+        rows = self._conn.execute("SELECT * FROM edges WHERE kind = 'CALLS'").fetchall()
+        edge_map: dict[str, list[str]] = {}  # source -> [target, ...]
+        edge_sec: dict[tuple[str, str], dict] = {}  # (src, tgt) -> edge extra
+        for r in rows:
+            e = self._row_to_edge(r)
+            edge_map.setdefault(e.source_qualified, []).append(e.target_qualified)
+            edge_extra = e.extra or {}
+            if edge_extra:
+                edge_sec[(e.source_qualified, e.target_qualified)] = edge_extra
+            # If edge has taint_relevant flag, target is a sink candidate
+            if edge_extra.get("taint_relevant"):
+                sink_nodes.add(e.target_qualified)
+
+        if not sink_nodes:
+            return []
+
+        # BFS from source
+        paths: list[list[str]] = []
+        queue: list[list[str]] = [[source_qn]]
+        visited: set[str] = set()
+
+        while queue:
+            path = queue.pop(0)
+            current = path[-1]
+
+            if len(path) > max_depth:
+                continue
+
+            if current in visited:
+                continue
+            visited.add(current)
+
+            # Check if current is a sink
+            if current != source_qn and current in sink_nodes:
+                paths.append(path)
+                continue  # Don't explore past sinks
+
+            # Explore CALLS edges from current
+            for target in edge_map.get(current, []):
+                if target not in visited:
+                    queue.append(path + [target])
+
+        return paths
 
     # --- Internal helpers ---
 
@@ -513,20 +599,33 @@ def _sanitize_name(s: str, max_len: int = 256) -> str:
 
 
 def node_to_dict(n: GraphNode) -> dict:
-    return {
+    d = {
         "id": n.id, "kind": n.kind, "name": _sanitize_name(n.name),
-        "qualified_name": _sanitize_name(n.qualified_name), "file_path": n.file_path,
+        "qualified_name": _sanitize_name(n.qualified_name),
+        "file_path": _sanitize_name(n.file_path, max_len=512),
         "line_start": n.line_start, "line_end": n.line_end,
         "language": n.language,
         "parent_name": _sanitize_name(n.parent_name) if n.parent_name else n.parent_name,
         "is_test": n.is_test,
     }
+    # Surface security tags if present
+    if n.extra and n.extra.get("security_tags"):
+        d["security_tags"] = n.extra["security_tags"]
+    return d
 
 
 def edge_to_dict(e: GraphEdge) -> dict:
-    return {
+    d = {
         "id": e.id, "kind": e.kind,
         "source": _sanitize_name(e.source_qualified),
         "target": _sanitize_name(e.target_qualified),
-        "file_path": e.file_path, "line": e.line,
+        "file_path": _sanitize_name(e.file_path, max_len=512),
+        "line": e.line,
     }
+    # Surface security metadata if present
+    if e.extra:
+        if e.extra.get("security_tags"):
+            d["security_tags"] = e.extra["security_tags"]
+        if e.extra.get("taint_relevant"):
+            d["taint_relevant"] = True
+    return d

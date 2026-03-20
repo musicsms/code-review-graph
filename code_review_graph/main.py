@@ -18,6 +18,7 @@ from .tools import (
     get_review_context,
     list_graph_stats,
     query_graph,
+    security_scan,
     semantic_search_nodes,
 )
 
@@ -205,6 +206,31 @@ def get_docs_section_tool(
         section_name: The section to retrieve (e.g. "review-delta", "usage").
     """
     return get_docs_section(section_name=section_name)
+
+
+@mcp.tool()
+def security_scan_tool(
+    changed_files: Optional[list[str]] = None,
+    repo_root: Optional[str] = None,
+    base: str = "HEAD~1",
+    severity_threshold: str = "low",
+) -> dict:
+    """Scan changed files for security anti-patterns using AST analysis.
+
+    Detects dangerous patterns: eval/exec calls, subprocess with shell=True,
+    SQL string formatting, hardcoded secrets, insecure deserialization,
+    command injection via os.system, and weak cryptographic functions.
+
+    Args:
+        changed_files: Files to scan. Auto-detected from git diff if omitted.
+        repo_root: Repository root path. Auto-detected if omitted.
+        base: Git ref for change detection. Default: HEAD~1.
+        severity_threshold: Minimum severity: critical, high, medium, low. Default: low.
+    """
+    return security_scan(
+        changed_files=changed_files, repo_root=repo_root,
+        base=base, severity_threshold=severity_threshold,
+    )
 
 
 def main() -> None:

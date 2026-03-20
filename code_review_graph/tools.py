@@ -19,12 +19,17 @@ from typing import Any
 from .embeddings import EmbeddingStore, embed_all_nodes, semantic_search
 from .graph import GraphStore, edge_to_dict, node_to_dict
 from .incremental import (
+    _validate_git_ref,
     find_project_root,
     full_build,
     get_changed_files,
     get_db_path,
     get_staged_and_unstaged,
     incremental_update,
+)
+from .security_patterns import (
+    finding_to_dict,
+    scan_changed_files_security,
 )
 
 
@@ -90,6 +95,7 @@ def build_or_update_graph(
                 **result,
             }
         else:
+            base = _validate_git_ref(base)
             result = incremental_update(root, store, base=base)
             if result["files_updated"] == 0:
                 return {
@@ -139,6 +145,7 @@ def get_impact_radius(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
+            base = _validate_git_ref(base)
             changed_files = get_changed_files(root, base)
             if not changed_files:
                 changed_files = get_staged_and_unstaged(root)
@@ -193,6 +200,10 @@ _QUERY_PATTERNS = {
     "tests_for": "Find all tests for a given function or class",
     "inheritors_of": "Find all classes that inherit from a given class",
     "file_summary": "Get a summary of all nodes in a file",
+    "security_profile": "List all security-tagged nodes in a file or module",
+    "taint_path": "Find call paths from a function to dangerous sinks",
+    "auth_boundary": "Find functions that involve authentication/authorization",
+    "unguarded_sinks": "Find dangerous sinks reachable without auth checks",
 }
 
 
@@ -315,6 +326,58 @@ def query_graph(
             for n in file_nodes:
                 results.append(node_to_dict(n))
 
+        elif pattern == "security_profile":
+            # List all security-tagged nodes in a file
+            abs_path = str(root / target)
+            file_nodes = store.get_nodes_by_file(abs_path)
+            for n in file_nodes:
+                if n.extra and n.extra.get("security_tags"):
+                    results.append(node_to_dict(n))
+            # Also check edges in this file for security metadata
+            for n in file_nodes:
+                for e in store.get_edges_by_source(n.qualified_name):
+                    if e.extra and (e.extra.get("security_tags") or e.extra.get("taint_relevant")):
+                        edges_out.append(edge_to_dict(e))
+
+        elif pattern == "taint_path":
+            # Find call paths from target to dangerous sinks
+            if node:
+                paths = store.find_paths_to_sinks(node.qualified_name)
+                for path in paths:
+                    results.append({
+                        "path": path,
+                        "length": len(path),
+                        "source": path[0] if path else "",
+                        "sink": path[-1] if path else "",
+                    })
+
+        elif pattern == "auth_boundary":
+            # Find functions tagged with auth
+            auth_nodes = store.get_nodes_by_security_tag("auth")
+            for n in auth_nodes:
+                results.append(node_to_dict(n))
+                # Show what auth functions call
+                for e in store.get_edges_by_source(n.qualified_name):
+                    if e.kind == "CALLS":
+                        edges_out.append(edge_to_dict(e))
+
+        elif pattern == "unguarded_sinks":
+            # Find dangerous sinks that are reachable without auth checks
+            sink_nodes = store.get_nodes_by_security_tag("dangerous_sink")
+            auth_nodes = {n.qualified_name for n in store.get_nodes_by_security_tag("auth")}
+            for n in sink_nodes:
+                # Check callers — if none have auth tags, it's unguarded
+                callers = []
+                for e in store.get_edges_by_target(n.qualified_name):
+                    if e.kind == "CALLS":
+                        callers.append(e.source_qualified)
+                has_auth_guard = any(c in auth_nodes for c in callers)
+                if not has_auth_guard:
+                    nd = node_to_dict(n)
+                    nd["callers"] = callers
+                    nd["has_auth_guard"] = False
+                    results.append(nd)
+
         return {
             "status": "ok",
             "pattern": pattern,
@@ -410,6 +473,14 @@ def get_review_context(
         # Generate review guidance
         guidance = _generate_review_guidance(impact, changed_files)
         context["review_guidance"] = guidance
+
+        # Generate security analysis
+        security_analysis = _generate_security_analysis(store, impact, abs_files)
+        if security_analysis["security_tagged_nodes"] or security_analysis["taint_paths"]:
+            context["security_analysis"] = security_analysis
+            security_guidance = _generate_security_guidance(security_analysis)
+            if security_guidance:
+                context["security_guidance"] = security_guidance
 
         summary_parts = [
             f"Review context for {len(changed_files)} changed file(s):",
@@ -512,6 +583,96 @@ def _generate_review_guidance(impact: dict, changed_files: list[str]) -> str:
         guidance_parts.append("- Changes appear well-contained with minimal blast radius.")
 
     return "\n".join(guidance_parts)
+
+
+def _generate_security_analysis(
+    store: GraphStore,
+    impact: dict,
+    abs_files: list[str],
+) -> dict[str, Any]:
+    """Analyze security aspects of impacted nodes."""
+    security_tagged: list[dict] = []
+    taint_paths: list[dict] = []
+    auth_crossings: list[dict] = []
+
+    # Collect security-tagged nodes from changed and impacted
+    all_nodes = impact["changed_nodes"] + impact["impacted_nodes"]
+    for n in all_nodes:
+        if n.extra and n.extra.get("security_tags"):
+            security_tagged.append({
+                "name": n.name,
+                "qualified_name": n.qualified_name,
+                "kind": n.kind,
+                "file_path": n.file_path,
+                "security_tags": n.extra["security_tags"],
+                "line": n.line_start,
+            })
+
+    # Find taint paths from changed input handlers to sinks
+    for n in impact["changed_nodes"]:
+        tags = (n.extra or {}).get("security_tags", [])
+        if "input_handler" in tags or n.kind == "Function":
+            paths = store.find_paths_to_sinks(n.qualified_name)
+            for path in paths:
+                taint_paths.append({
+                    "source": path[0],
+                    "sink": path[-1],
+                    "path": path,
+                    "length": len(path),
+                })
+
+    # Check for auth boundary crossings in edges
+    for e in impact["edges"]:
+        edge_tags = (e.extra or {}).get("security_tags", [])
+        if "auth" in edge_tags:
+            auth_crossings.append({
+                "from": e.source_qualified,
+                "to": e.target_qualified,
+                "tags": edge_tags,
+            })
+
+    return {
+        "security_tagged_nodes": security_tagged,
+        "taint_paths": taint_paths,
+        "auth_crossings": auth_crossings,
+    }
+
+
+def _generate_security_guidance(analysis: dict[str, Any]) -> str:
+    """Generate security-specific review guidance from analysis results."""
+    parts: list[str] = []
+
+    tagged = analysis.get("security_tagged_nodes", [])
+    if tagged:
+        # Group by tag
+        tag_groups: dict[str, list[str]] = {}
+        for n in tagged:
+            for tag in n["security_tags"]:
+                tag_groups.setdefault(tag, []).append(n["name"])
+        for tag, names in sorted(tag_groups.items()):
+            unique_names = list(dict.fromkeys(names))[:5]  # Dedup + limit
+            parts.append(
+                f"- [{tag}] {len(names)} node(s) tagged: "
+                + ", ".join(f"`{n}`" for n in unique_names)
+            )
+
+    taint_paths = analysis.get("taint_paths", [])
+    if taint_paths:
+        parts.append(f"- ⚠ {len(taint_paths)} taint path(s) found (input → sink):")
+        for tp in taint_paths[:3]:  # Show max 3
+            parts.append(
+                f"  - `{tp['source'].rsplit('::', 1)[-1]}` → "
+                f"`{tp['sink'].rsplit('::', 1)[-1]}` ({tp['length']} hops)"
+            )
+
+    crossings = analysis.get("auth_crossings", [])
+    if crossings:
+        parts.append(
+            f"- 🔐 {len(crossings)} auth boundary crossing(s) — "
+            "verify permission checks"
+        )
+
+    return "\n".join(parts) if parts else ""
 
 
 # ---------------------------------------------------------------------------
@@ -774,4 +935,84 @@ def get_docs_section(section_name: str) -> dict[str, Any]:
             f"Section '{section_name}' not found. "
             f"Available: {', '.join(available)}"
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 9: security_scan
+# ---------------------------------------------------------------------------
+
+
+def security_scan(
+    changed_files: list[str] | None = None,
+    repo_root: str | None = None,
+    base: str = "HEAD~1",
+    severity_threshold: str = "low",
+) -> dict[str, Any]:
+    """Scan changed files for security anti-patterns.
+
+    Uses Tree-sitter AST analysis to detect dangerous patterns such as:
+    eval/exec calls, subprocess with shell=True, SQL string formatting,
+    hardcoded secrets, insecure deserialization, command injection,
+    and weak cryptographic functions.
+
+    Args:
+        changed_files: Explicit list of files to scan (relative to repo root).
+                       If omitted, auto-detects from git diff.
+        repo_root: Repository root path. Auto-detected if omitted.
+        base: Git ref for auto-detecting changes (default: HEAD~1).
+        severity_threshold: Minimum severity to include: critical, high,
+                            medium, or low (default: low = show all).
+
+    Returns:
+        Dict with findings list, summary, and statistics.
+    """
+    root = (
+        _validate_repo_root(Path(repo_root)) if repo_root else find_project_root()
+    )
+
+    if changed_files is None:
+        base = _validate_git_ref(base)
+        changed_files = get_changed_files(root, base)
+        if not changed_files:
+            changed_files = get_staged_and_unstaged(root)
+
+    if not changed_files:
+        return {
+            "status": "ok",
+            "summary": "No changed files detected.",
+            "findings": [],
+            "total_findings": 0,
+        }
+
+    findings = scan_changed_files_security(
+        root, changed_files, severity_threshold=severity_threshold,
+    )
+
+    findings_dicts = [finding_to_dict(f) for f in findings]
+
+    # Build severity summary
+    severity_counts: dict[str, int] = {}
+    for f in findings:
+        severity_counts[f.severity] = severity_counts.get(f.severity, 0) + 1
+
+    if findings:
+        summary_parts = [
+            f"Found {len(findings)} security issue(s) in {len(changed_files)} file(s):",
+        ]
+        for sev in ("critical", "high", "medium", "low"):
+            count = severity_counts.get(sev, 0)
+            if count:
+                summary_parts.append(f"  - {sev}: {count}")
+        summary = "\n".join(summary_parts)
+    else:
+        summary = f"No security issues found in {len(changed_files)} file(s). ✓"
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "findings": findings_dicts,
+        "total_findings": len(findings),
+        "severity_counts": severity_counts,
+        "files_scanned": changed_files,
     }

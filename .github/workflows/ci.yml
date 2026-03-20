@@ -61,3 +61,18 @@ jobs:
         run: pip install -e ".[dev]" pytest-cov
       - name: Run tests with coverage
         run: pytest --tb=short -q --cov=code_review_graph --cov-report=term-missing --cov-fail-under=50
+
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install pip-audit and project
+        run: |
+          pip install pip-audit
+          pip install -e "."
+      - name: Audit dependencies for known vulnerabilities
+        run: pip-audit
