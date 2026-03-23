@@ -88,7 +88,10 @@ def _resolve_target(
     return candidates[0]
 
 
-def export_graph_data(store: GraphStore) -> dict:
+def export_graph_data(
+    store: GraphStore,
+    changed_lines: dict[str, list[tuple[int, int]]] | None = None,
+) -> dict:
     """Export all graph nodes and edges as a JSON-serializable dict.
 
     Returns ``{"nodes": [...], "edges": [...], "stats": {...}}``.
@@ -103,6 +106,29 @@ def export_graph_data(store: GraphStore) -> dict:
             d = node_to_dict(gnode)
             d["params"] = gnode.params
             d["return_type"] = gnode.return_type
+
+            # Highlight if node is in a changed file or changed line range
+            if changed_lines:
+                rel_path = ""
+                # Try to resolve relative path from absolute path
+                for root_path in [Path.cwd(), Path(store.db_path).parent.parent]:
+                    try:
+                        rel_path = str(Path(file_path).relative_to(root_path))
+                        break
+                    except ValueError:
+                        continue
+
+                if rel_path in changed_lines:
+                    # File node is always marked as modified if the file changed
+                    if gnode.kind == "File":
+                        d["is_modified"] = True
+                    else:
+                        # Check for overlap between node lines and changed lines
+                        for start, end in changed_lines[rel_path]:
+                            if (gnode.line_start <= end and gnode.line_end >= start):
+                                d["is_modified"] = True
+                                break
+
             nodes.append(d)
 
     name_index = _build_name_index(nodes, seen_qn)
@@ -129,13 +155,17 @@ def export_graph_data(store: GraphStore) -> dict:
     }
 
 
-def generate_html(store: GraphStore, output_path: str | Path) -> Path:
+def generate_html(
+    store: GraphStore,
+    output_path: str | Path,
+    changed_lines: dict[str, list[tuple[int, int]]] | None = None,
+) -> Path:
     """Generate a self-contained interactive HTML visualization.
 
     Writes the HTML file to *output_path* and returns the resolved Path.
     """
     output_path = Path(output_path)
-    data = export_graph_data(store)
+    data = export_graph_data(store, changed_lines=changed_lines)
     data_json = json.dumps(data, default=str)
     html = _HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
     output_path.write_text(html, encoding="utf-8")
@@ -248,6 +278,17 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #search::placeholder { color: #484f58; }
 
   marker { overflow: visible; }
+  .node-circle.is-modified {
+    stroke: #f2c744;
+    stroke-width: 3px;
+    filter: drop-shadow(0 0 4px #f2c744);
+    animation: modified-pulse 2s infinite;
+  }
+  @keyframes modified-pulse {
+    0% { filter: drop-shadow(0 0 2px #f2c744); }
+    50% { filter: drop-shadow(0 0 8px #f2c744); }
+    100% { filter: drop-shadow(0 0 2px #f2c744); }
+  }
 </style>
 </head>
 <body>
@@ -268,6 +309,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="legend-item" data-edge-kind="INHERITS"><span class="legend-line l-inherits"></span> Inherits</div>
     <div class="legend-item" data-edge-kind="CONTAINS"><span class="legend-line l-contains"></span> Contains</div>
   </div>
+  <h3>Changes</h3>
+  <div class="legend-section">
+    <div class="legend-item"><span class="legend-circle" style="background:#f2c744; box-shadow: 0 0 5px #f2c744"></span> Modified in MR</div>
+  </div>
 </div>
 
 <div id="controls">
@@ -285,6 +330,7 @@ const graphData = __GRAPH_DATA__;
 
 // -- Config --
 const KIND_COLOR  = { File:"#58a6ff", Class:"#f0883e", Function:"#3fb950", Test:"#d2a8ff", Type:"#8b949e" };
+const MODIFIED_COLOR = "#f2c744";
 const KIND_RADIUS = { File:18, Class:12, Function:6, Test:6, Type:5 };
 const EDGE_COLOR  = { CALLS:"#3fb950", IMPORTS_FROM:"#f0883e", INHERITS:"#d2a8ff", CONTAINS:"rgba(139,148,158,0.15)" };
 
@@ -470,11 +516,14 @@ function updateNodes() {
     .attr("filter","url(#glow)");
 
   // Main node circle
-  enter.append("circle").attr("class","node-circle")
+  enter.append("circle").attr("class", d => "node-circle" + (d.is_modified ? " is-modified" : ""))
     .attr("r", d => KIND_RADIUS[d.kind] || 6)
     .attr("fill", d => KIND_COLOR[d.kind] || "#8b949e")
-    .attr("stroke", d => d.kind === "File" ? "rgba(88,166,255,0.3)" : "rgba(255,255,255,0.08)")
-    .attr("stroke-width", d => d.kind === "File" ? 2 : 1)
+    .attr("stroke", d => {
+        if (d.is_modified) return MODIFIED_COLOR;
+        return d.kind === "File" ? "rgba(88,166,255,0.3)" : "rgba(255,255,255,0.08)";
+    })
+    .attr("stroke-width", d => (d.is_modified) ? 3 : (d.kind === "File" ? 2 : 1))
     .attr("cursor", d => d.kind === "File" ? "pointer" : "grab");
 
   enter

@@ -179,6 +179,7 @@ def main() -> None:
     # visualize
     vis_cmd = sub.add_parser("visualize", help="Generate interactive HTML graph visualization")
     vis_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    vis_cmd.add_argument("--base", default=None, help="Git diff base to highlight changes (e.g. HEAD~1, main)")
 
     # serve
     sub.add_parser("serve", help="Start MCP server (stdio transport)")
@@ -257,10 +258,22 @@ def main() -> None:
 
         elif args.command == "visualize":
             from .visualization import generate_html
+            from .incremental import get_changed_line_ranges
+
+            changed_lines = None
+            if args.base:
+                changed_lines = get_changed_line_ranges(repo_root, base=args.base)
+                if changed_lines:
+                    print(f"Highlighting changes since {args.base} ({len(changed_lines)} files)")
+                else:
+                    print(f"No changes detected since {args.base}")
+
             html_path = repo_root / ".code-review-graph" / "graph.html"
-            generate_html(store, html_path)
+            generate_html(store, html_path, changed_lines=changed_lines)
             print(f"Visualization: {html_path}")
             print("Open in browser to explore your codebase graph.")
 
     finally:
         store.close()
+
+# Test comment for highlight verification

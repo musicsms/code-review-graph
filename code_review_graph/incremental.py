@@ -191,6 +191,54 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
         return []
 
 
+def get_changed_line_ranges(
+    repo_root: Path, base: str = "HEAD~1"
+) -> dict[str, list[tuple[int, int]]]:
+    """Get modified line ranges for each changed file via git diff -U0.
+
+    Returns:
+        Mapping of relative file path to list of (start_line, end_line) ranges.
+        Lines are 1-indexed.
+    """
+    base = _validate_git_ref(base)
+    # Ensure current_file doesn't look like a git ref
+    try:
+        # -U0 means zero lines of context, which makes parsing hunk headers easier
+        result = subprocess.run(
+            ["git", "diff", "-U0", base],
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
+        )
+        if result.returncode != 0:
+            return {}
+
+        ranges: dict[str, list[tuple[int, int]]] = {}
+        current_file: str | None = None
+
+        # Parse output for hunk headers like:
+        # +++ b/path/to/file.py
+        # @@ -10,3 +10,5 @@
+        # This means lines 10 through 14 (10 + 5 - 1) in the new file are changed.
+        for line in result.stdout.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:].strip()
+            elif line.startswith("@@ ") and current_file:
+                # Format: @@ -old_start,old_len +new_start,new_len @@
+                match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                if match:
+                    start = int(match.group(1))
+                    count = int(match.group(2)) if match.group(2) else 1
+                    if count >= 0:
+                        end = start + max(0, count - 1)
+                        ranges.setdefault(current_file, []).append((start, end))
+
+        return ranges
+    except (FileNotFoundError, subprocess.TimeoutExpired, re.error):
+        return {}
+
+
 def get_staged_and_unstaged(repo_root: Path) -> list[str]:
     """Get all modified files (staged + unstaged + untracked)."""
     try:
