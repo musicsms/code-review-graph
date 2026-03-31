@@ -643,8 +643,45 @@ class TestPerlParsing:
 
     def test_finds_calls(self):
         calls = [e for e in self.edges if e.kind == "CALLS"]
-        assert len(calls) >= 1
+        targets = {e.target for e in calls}
+        assert any(t == "speak" or t.endswith("::speak") for t in targets)  # $self->speak() — method_call_expression
+        assert "bless" in targets  # ambiguous_function_call_expression
 
     def test_finds_contains(self):
         contains = [e for e in self.edges if e.kind == "CONTAINS"]
         assert len(contains) >= 3
+
+
+class TestXSParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "sample.xs")
+
+    def test_detects_language(self):
+        assert self.parser.detect_language(Path("MyModule.xs")) == "c"
+
+    def test_finds_structs(self):
+        classes = [n for n in self.nodes if n.kind == "Class"]
+        names = {c.name for c in classes}
+        assert "Point" in names
+
+    def test_finds_functions(self):
+        funcs = [n for n in self.nodes if n.kind == "Function"]
+        names = {f.name for f in funcs}
+        assert "_add" in names
+        assert "compute_distance" in names
+
+    def test_finds_includes(self):
+        imports = [e for e in self.edges if e.kind == "IMPORTS_FROM"]
+        targets = {e.target for e in imports}
+        assert "XSUB.h" in targets
+        assert "string.h" in targets
+
+    def test_finds_calls(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        assert any(t == "_add" or t.endswith("::_add") for t in targets)  # compute_distance calls _add
+
+    def test_finds_contains(self):
+        contains = [e for e in self.edges if e.kind == "CONTAINS"]
+        assert len(contains) >= 3  # Point, _add, compute_distance

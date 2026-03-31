@@ -29,5 +29,5 @@ sub fetch {
 
 sub bark {
     my ($self) = @_;
-    print speak($self) . "\n";
+    print $self->speak() . "\n";
 }

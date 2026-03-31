@@ -81,7 +81,7 @@ uv run code-review-graph eval               # Run evaluation benchmarks
 - `tests/test_tools.py` — MCP tool integration tests
 - `tests/test_visualization.py` — Export, HTML generation, C++ resolution
 - `tests/test_incremental.py` — Build, update, migration, git ops
-- `tests/test_multilang.py` — 18 language parsing tests (including Vue, Solidity, Dart, R, Perl)
+- `tests/test_multilang.py` — 18 language parsing tests (including Vue, Solidity, Dart, R, Perl, XS)
 - `tests/test_embeddings.py` — Vector encode/decode, similarity, store
 - `tests/test_flows.py` — Execution flow detection and criticality
 - `tests/test_communities.py` — Community detection, architecture overview

@@ -84,6 +84,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".pl": "perl",
     ".pm": "perl",
     ".t": "perl",
+    ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
 }
 
 # Tree-sitter node type mappings per language
@@ -188,7 +189,10 @@ _CALL_TYPES: dict[str, list[str]] = {
     "csharp": ["invocation_expression", "object_creation_expression"],
     "ruby": ["call", "method_call"],
     "r": ["call"],
-    "perl": ["function_call_expression", "method_call_expression"],
+    "perl": [
+        "function_call_expression", "method_call_expression",
+        "ambiguous_function_call_expression",
+    ],
     "kotlin": ["call_expression"],
     "swift": ["call_expression"],
     "php": ["function_call_expression", "member_call_expression"],
@@ -1593,11 +1597,18 @@ class CodeParser:
         if language == "solidity" and first.type == "expression" and first.children:
             first = first.children[0]
 
+        # Perl method_call_expression: $obj->method() — find the 'method' child
+        if language == "perl" and node.type == "method_call_expression":
+            for child in node.children:
+                if child.type == "method":
+                    return child.text.decode("utf-8", errors="replace")
+            return None  # method child not found
+
         # Simple call: func_name(args)
         if first.type == "identifier":
             return first.text.decode("utf-8", errors="replace")
 
-        # Perl: function_call_expression has a 'function' child
+        # Perl: function_call_expression / ambiguous_function_call_expression
         if first.type == "function":
             return first.text.decode("utf-8", errors="replace")
 
